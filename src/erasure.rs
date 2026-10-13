@@ -133,6 +133,15 @@ pub fn erase(
             crate::index::INDEX_MD.to_string(),
             Change::Write { content: crate::index::index_md_after(repo, &base, &index_updates)? },
         ));
+        let (okf_index, okf_log) = crate::index::okf_after(repo, &base, &index_updates)?;
+        changes.push((
+            crate::index::OKF_INDEX_MD.to_string(),
+            Change::Write { content: okf_index },
+        ));
+        changes.push((
+            crate::index::OKF_LOG_MD.to_string(),
+            Change::Write { content: okf_log },
+        ));
     }
     changes.push(("state/controls.json".to_string(), Change::Write { content: controls.render()? }));
     let request_id = format!("erase_{}_{}", short_hash(target), Utc::now().timestamp_millis());
@@ -411,7 +420,7 @@ mod tests {
             expires_at: None,
             review_after: None,
             supersedes: vec![],
-            sources: vec![SourceRef { event_id: event_id.into(), role: FactRole::User, evidence: statement.into() }],
+            sources: vec![SourceRef { event_id: event_id.into(), role: FactRole::User, evidence: statement.into(), author: None, last_modified: None, usage_count: None }],
             visibility: Visibility::Private,
         }
     }

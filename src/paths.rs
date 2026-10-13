@@ -3,7 +3,10 @@
 //! The repository is the only writable surface; the agent only ever talks to it
 //! through validated paths. Allowed paths are restricted to:
 //! - top-level Markdown summaries (`PROFILE.md`, `ONEPAGER.md`, `INDEX.md`),
-//! - entity files under `memory/<bucket>/<id>.md`,
+//! - OKF bundle files (`index.md`, `log.md`, §8/§9),
+//! - entity files under `memory/<bucket>/<id>.md` (incl. `computations/` for
+//!   Attested Computation concepts, §10),
+//! - `references/` mirrored material (§6.3),
 //! - session recap and task files under `sessions/<session-id>/`,
 //! - the small JSON control files (`state/checkpoint.json`, `state/controls.json`),
 //! - and the internal receipt path `state/receipts/<request-id>.json`.
@@ -25,13 +28,15 @@ impl PathRules {
     pub fn new() -> Self {
         let patterns = [
             r"(?:PROFILE|ONEPAGER|INDEX)\.md",
-            r"memory/(?:people|orgs|preferences|conversations|workstreams)/[A-Za-z0-9_-]{1,80}\.md",
+            r"(?:index|log)\.md",
+            r"memory/(?:people|orgs|preferences|conversations|workstreams|computations)/[A-Za-z0-9_-]{1,80}\.md",
+            r"references/(?:.+)",
             r"sessions/[A-Za-z0-9_-]{1,80}/(?:RECAP|TASKS)\.md",
             r"state/(?:checkpoint|controls)\.json",
             r"state/dispositions/[A-Za-z0-9_-]{1,80}\.json",
         ];
         let set = RegexSet::new(patterns).expect("static patterns compile");
-        let entity_id = Regex::new(r"^(?:p|o|pref|c|w)_(?:[A-Za-z0-9_-]{1,80})$")
+        let entity_id = Regex::new(r"^(?:p|o|pref|c|w|ac)_(?:[A-Za-z0-9_-]{1,80})$")
             .expect("static pattern compiles");
         let session_id = Regex::new(r"^[A-Za-z0-9_-]{1,80}$").expect("static pattern");
         Self {

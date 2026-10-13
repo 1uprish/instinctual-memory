@@ -159,15 +159,42 @@ pub fn apply_against_base(
     // Build the change set: entity, INDEX.md, controls (if any), and
     // checkpoint (if any).
     let mut new_entity = new_entity;
+    // OKF §5.2: a direct human change is both generated and human-verified.
+    let now = chrono::Utc::now();
+    match new_entity.generated.as_mut() {
+        Some(g) => g.at = now,
+        None => {
+            new_entity.generated = Some(crate::entity::Generated {
+                by: format!("mem/{}", env!("CARGO_PKG_VERSION")),
+                at: now,
+            })
+        }
+    }
+    if matches!(request.kind, ChangeKind::Remember | ChangeKind::Correct)
+        && !new_entity.verified.iter().any(|v| v.by.starts_with("human:"))
+    {
+        new_entity.verified.push(crate::entity::Verification {
+            by: "human:operator".to_string(),
+            at: now,
+        });
+    }
     new_entity.refresh_body();
     let index_md = crate::index::index_md_after(
         repo,
         base,
         &[(entity_path.clone(), Some(new_entity.clone()))].into_iter().collect(),
     )?;
-    let mut changes: Vec<(String, Change)> = Vec::new();
-    changes.push((entity_path.clone(), Change::Write { content: new_entity.render() }));
-    changes.push((crate::index::INDEX_MD.to_string(), Change::Write { content: index_md }));
+    let (okf_index, okf_log) = crate::index::okf_after(
+        repo,
+        base,
+        &[(entity_path.clone(), Some(new_entity.clone()))].into_iter().collect(),
+    )?;
+    let mut changes: Vec<(String, Change)> = vec![
+        (entity_path.clone(), Change::Write { content: new_entity.render() }),
+        (crate::index::INDEX_MD.to_string(), Change::Write { content: index_md }),
+        (crate::index::OKF_INDEX_MD.to_string(), Change::Write { content: okf_index }),
+        (crate::index::OKF_LOG_MD.to_string(), Change::Write { content: okf_log }),
+    ];
     if let Some((path, content)) = affected_controls {
         changes.push((path, Change::Write { content }));
     }
@@ -200,6 +227,8 @@ pub fn apply_against_base(
 fn new_entity(id: &str) -> EntityFile {
     let entity_type = if id.starts_with("pref_") {
         "preference"
+    } else if id.starts_with("ac_") {
+        "Attested Computation"
     } else {
         match id.chars().next().unwrap_or('p') {
             'p' => "person",
@@ -214,17 +243,31 @@ fn new_entity(id: &str) -> EntityFile {
         id: id.to_string(),
         entity_type: entity_type.to_string(),
         title: id.to_string(),
+        description: None,
+        resource: None,
+        tags: vec![entity_type.to_string()],
+        generated: Some(crate::entity::Generated {
+            by: format!("mem/{}", env!("CARGO_PKG_VERSION")),
+            at: chrono::Utc::now(),
+        }),
+        verified: vec![],
+        status: None,
+        stale_after: None,
+        sources: vec![],
         aliases: Vec::new(),
         links: Vec::new(),
         facts: Vec::new(),
         visibility: crate::fact::Visibility::Private,
         body: format!("# {id}\n"),
+        extra: Default::default(),
     }
 }
 
 fn entity_path_for(entity_id: &str, _scope_id: &str) -> Result<String> {
     let (bucket, stripped) = if entity_id.starts_with("pref_") {
         ("preferences", entity_id.strip_prefix("pref_").unwrap_or(entity_id))
+    } else if entity_id.starts_with("ac_") {
+        ("computations", entity_id.strip_prefix("ac_").unwrap_or(entity_id))
     } else {
         let bucket = match entity_id.chars().next().unwrap_or('p') {
             'p' => "people",

@@ -130,6 +130,19 @@ pub struct SourceRef {
     pub event_id: String,
     pub role: Role,
     pub evidence: String,
+    /// OKF §5.1 credibility signal: who/what produced the source,
+    /// in actor convention (`human:<id>`, `<producer>/<version>`,
+    /// `process:<id>`). None when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// OKF §5.1 recency signal: when the source itself last changed.
+    /// Distinct from the concept's `generated.at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<DateTime<Utc>>,
+    /// OKF §5.1 liveness signal: exercise count over `usage_window`.
+    /// Coarse (alive-vs-dead), not a ranking score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

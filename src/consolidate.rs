@@ -173,6 +173,30 @@ impl Consolidator {
                 crate::index::INDEX_MD.to_string(),
                 Change::Write { content: crate::index::render_index_md(extraction.entities.values()) },
             ));
+            // OKF §8/§9 companions: root index.md (with okf_version) + log.md.
+            let owned: Vec<(String, &EntityFile)> = extraction
+                .entities
+                .iter()
+                .map(|(id, e)| (entity_path(id), e))
+                .collect();
+            let ordered: Vec<(&str, &EntityFile)> =
+                owned.iter().map(|(p, e)| (p.as_str(), *e)).collect();
+            changes.push((
+                crate::index::OKF_INDEX_MD.to_string(),
+                Change::Write { content: crate::index::render_okf_index_md(ordered, true) },
+            ));
+            let log_entries: Vec<(String, String)> = extraction
+                .changed
+                .iter()
+                .map(|id| {
+                    let title = extraction.entities.get(id).map(|e| e.title.as_str()).unwrap_or(id);
+                    ("Update".to_string(), format!("Updated [{title}]({}).", entity_path(id)))
+                })
+                .collect();
+            changes.push((
+                crate::index::OKF_LOG_MD.to_string(),
+                Change::Write { content: crate::index::render_okf_log_md(&log_entries) },
+            ));
         }
 
         let mut quarantined: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -390,6 +414,9 @@ impl Extraction {
                 event_id: event.event_id.clone(),
                 role: fact_role(event.role),
                 evidence: p.evidence,
+                author: None,
+                last_modified: Some(event.occurred_at),
+                usage_count: None,
             }],
             visibility: Visibility::Private,
         };
@@ -399,6 +426,29 @@ impl Extraction {
                 .entities
                 .entry(id.clone())
                 .or_insert_with(|| blank_entity(&id, &p.entity_type, &p.title));
+            // OKF §5: concept-level provenance + generation stamp.
+            // The concept source id is the journal event id, so body
+            // footnotes ([^<event_id>]) join stably through reordering.
+            if !entity.sources.iter().any(|s| s.id.as_deref() == Some(event.event_id.as_str())) {
+                entity.sources.push(crate::entity::OkfSource {
+                    id: Some(event.event_id.clone()),
+                    resource: format!("journal:{}", event.event_id),
+                    title: None,
+                    author: None,
+                    usage_count: None,
+                    last_modified: Some(event.occurred_at),
+                });
+            }
+            let now = chrono::Utc::now();
+            match entity.generated.as_mut() {
+                Some(g) => g.at = now,
+                None => {
+                    entity.generated = Some(crate::entity::Generated {
+                        by: format!("mem/{}", env!("CARGO_PKG_VERSION")),
+                        at: now,
+                    })
+                }
+            }
             let exists = entity.facts.iter().any(|f| f.id == fact.id);
             if !exists && entity.render().len() + fact.statement.len() + 600 > ENTITY_SOFT_LIMIT {
                 continue;
@@ -487,22 +537,37 @@ fn fact_role(role: Role) -> FactRole {
 }
 
 fn blank_entity(id: &str, entity_type: &str, title: &str) -> EntityFile {
+    let now = chrono::Utc::now();
     EntityFile {
         schema_version: 2,
         id: id.to_string(),
         entity_type: entity_type.to_string(),
         title: title.to_string(),
+        description: None,
+        resource: None,
+        tags: vec![entity_type.to_string()],
+        generated: Some(crate::entity::Generated {
+            by: format!("mem/{}", env!("CARGO_PKG_VERSION")),
+            at: now,
+        }),
+        verified: vec![],
+        status: None,
+        stale_after: None,
+        sources: vec![],
         aliases: vec![],
         links: vec![],
         facts: vec![],
         visibility: Visibility::Private,
         body: format!("# {title}\n"),
+        extra: Default::default(),
     }
 }
 
 fn entity_path(id: &str) -> String {
     let (bucket, rest) = if let Some(rest) = id.strip_prefix("pref_") {
         ("preferences", rest)
+    } else if let Some(rest) = id.strip_prefix("ac_") {
+        ("computations", rest)
     } else if let Some(rest) = id.strip_prefix("p_") {
         ("people", rest)
     } else if let Some(rest) = id.strip_prefix("o_") {
