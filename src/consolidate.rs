@@ -44,6 +44,12 @@ pub struct ConsolidateOptions {
     pub request_id: String,
     pub high_water: u64,
     pub scope_id: Option<String>,
+    /// Rewind the checkpoint to re-process events from this seq (1-based).
+    /// `None` (or 0) resumes after the checkpoint as usual. Re-extraction is
+    /// idempotent: fact ids are deterministic hashes, so re-placing a fact
+    /// updates it instead of duplicating it. Each attempt still publishes
+    /// under a fresh request id, preserving a history of attempts.
+    pub from_seq: Option<u64>,
 }
 
 /// Result of one consolidation pass.
@@ -55,9 +61,37 @@ pub struct ConsolidateReport {
     pub accepted: usize,
     pub facts: usize,
     pub entities_changed: usize,
+    /// Facts the LLM proposed across all batches (0 for rules).
+    pub proposed: usize,
+    /// Proposed facts dropped by validation (0 for rules).
+    pub rejected: usize,
     /// No events were left after the checkpoint.
     pub caught_up: bool,
     pub extractor: ExtractorKind,
+}
+
+/// One fact the model proposed but validation dropped, with why.
+/// Distinguishes "the model saw nothing durable" (empty batch) from
+/// "the model proposed facts that failed checks" — previously both
+/// collapsed into the same `no durable fact` quarantine bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedFact {
+    /// The event ref number the model cited.
+    pub event_ref: u64,
+    pub statement: String,
+    pub reason: String,
+}
+
+/// Per-LLM-batch outcome: what the model returned vs what survived.
+/// Rules extraction leaves this empty; its quarantines already say why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchReport {
+    pub batch: usize,
+    pub from_seq: u64,
+    pub through_seq: u64,
+    pub proposed: usize,
+    pub accepted: Vec<u64>,
+    pub rejected: Vec<RejectedFact>,
 }
 
 /// Per-batch outcome record, stored next to the checkpoint.
@@ -71,6 +105,10 @@ pub struct Dispositions {
     pub accepted: Vec<u64>,
     /// Reason -> seqs that produced none.
     pub quarantined: BTreeMap<String, Vec<u64>>,
+    /// Per-LLM-batch detail (empty for rules). Old files without this
+    /// key still parse.
+    #[serde(default)]
+    pub batches: Vec<BatchReport>,
 }
 
 /// What an extractor hands back to the publisher.
@@ -82,6 +120,7 @@ struct Extraction {
     accepted: BTreeSet<u64>,
     quarantined: BTreeMap<u64, String>,
     facts: usize,
+    batches: Vec<BatchReport>,
 }
 
 /// Commits are capped at 64 files; leave room for checkpoint + dispositions.
@@ -112,6 +151,13 @@ impl Consolidator {
             .unwrap_or_else(Checkpoint::empty);
 
         let extractor = resolve_extractor(options.extractor);
+        // --from-seq rewinds a checkpoint that already advanced, so a run
+        // that flip-flopped to zero facts can simply be attempted again.
+        if let Some(n) = options.from_seq {
+            if n >= 1 && n - 1 < checkpoint.through_seq {
+                checkpoint.through_seq = n - 1;
+            }
+        }
         let all_after: Vec<JournalEvent> = journal.read_from(checkpoint.through_seq + 1)?;
         let Some(window_end) = all_after
             .iter()
@@ -126,6 +172,8 @@ impl Consolidator {
                 accepted: 0,
                 facts: 0,
                 entities_changed: 0,
+                proposed: 0,
+                rejected: 0,
                 caught_up: true,
                 extractor,
             });
@@ -203,6 +251,8 @@ impl Consolidator {
         for (seq, reason) in &extraction.quarantined {
             quarantined.entry(reason.clone()).or_default().push(*seq);
         }
+        let proposed: usize = extraction.batches.iter().map(|b| b.proposed).sum();
+        let rejected: usize = extraction.batches.iter().map(|b| b.rejected.len()).sum();
         let dispositions = Dispositions {
             request_id: options.request_id.clone(),
             extractor,
@@ -210,6 +260,7 @@ impl Consolidator {
             through_seq: window_end,
             accepted: extraction.accepted.iter().copied().collect(),
             quarantined,
+            batches: std::mem::take(&mut extraction.batches),
         };
         changes.push((
             format!("state/dispositions/{}.json", options.request_id),
@@ -232,6 +283,8 @@ impl Consolidator {
             accepted: extraction.accepted.len(),
             facts: extraction.facts,
             entities_changed: extraction.changed.len(),
+            proposed,
+            rejected,
             caught_up: false,
             extractor,
         })
@@ -380,6 +433,7 @@ impl Extraction {
             accepted: BTreeSet::new(),
             quarantined: BTreeMap::new(),
             facts: 0,
+            batches: Vec::new(),
         }
     }
 
@@ -740,11 +794,26 @@ fn llm_extract(
 
     let by_seq: BTreeMap<u64, &JournalEvent> = events.iter().map(|e| (e.seq, e)).collect();
     let verbose = std::env::var("MEM_CONSOLIDATE_VERBOSE").is_ok_and(|v| v == "1");
-    for (batch, reply) in batches.iter().zip(replies) {
+    for (bi, (batch, reply)) in batches.iter().zip(replies).enumerate() {
         let reply = reply?;
         let in_batch: BTreeSet<u64> = batch.iter().map(|(e, _)| e.seq).collect();
+        let mut report = BatchReport {
+            batch: bi,
+            from_seq: batch.first().map(|(e, _)| e.seq).unwrap_or(0),
+            through_seq: batch.last().map(|(e, _)| e.seq).unwrap_or(0),
+            proposed: reply.facts.len(),
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+        };
         for fact in reply.facts {
             if !in_batch.contains(&fact.event_ref) {
+                // The model cited an event outside this batch: a protocol
+                // violation, recorded rather than silently dropped.
+                report.rejected.push(RejectedFact {
+                    event_ref: fact.event_ref,
+                    statement: fact.statement.clone(),
+                    reason: "event ref outside batch".to_string(),
+                });
                 continue;
             }
             let event = by_seq[&fact.event_ref];
@@ -752,14 +821,26 @@ fn llm_extract(
                 Ok(proposal) => {
                     ex.place(proposal, event);
                     ex.accepted.insert(event.seq);
+                    report.accepted.push(event.seq);
                 }
-                Err(reason) if verbose => eprintln!(
-                    "[consolidate] rejected ({reason}): {} | evidence: {}",
-                    fact.statement, fact.evidence
-                ),
-                Err(_) => {}
+                Err(reason) => {
+                    // Always recorded in the disposition; stderr only
+                    // with MEM_CONSOLIDATE_VERBOSE=1.
+                    if verbose {
+                        eprintln!(
+                            "[consolidate] rejected ({reason}): {} | evidence: {}",
+                            fact.statement, fact.evidence
+                        );
+                    }
+                    report.rejected.push(RejectedFact {
+                        event_ref: fact.event_ref,
+                        statement: fact.statement.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
             }
         }
+        ex.batches.push(report);
     }
     // A memory file spans several chunks and batches; decide per event only
     // once every chunk has been read.
@@ -1121,6 +1202,7 @@ mod tests {
             request_id: id.into(),
             high_water: 100,
             scope_id: Some("personal".into()),
+            from_seq: None,
         }
     }
 
@@ -1162,6 +1244,66 @@ mod tests {
         let cp = repo.read_snapshot(&head, "state/checkpoint.json").unwrap().unwrap();
         assert!(cp.content.len() < 1_000, "{}", cp.content.len());
         assert!(Checkpoint::parse(&cp.content).unwrap().through_seq == 302);
+    }
+
+    #[test]
+    fn from_seq_rewinds_checkpoint_for_another_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = GitRepo::create(tmp.path()).unwrap();
+        let journal = Journal::open(tmp.path().join("journal")).unwrap();
+        user(&journal, "m1", "Hello, my name is Alice.");
+        Consolidator::run(&repo, &journal, &options("consol_1")).unwrap();
+        let head1 = repo.head().unwrap();
+        // Caught up: nothing left to do.
+        let idle = Consolidator::run_batch(&repo, &journal, &options("consol_2")).unwrap();
+        assert!(idle.caught_up);
+        assert_eq!(idle.revision, head1);
+        // Rewind: re-processes seq 1, idempotent (same deterministic fact id,
+        // still exactly one fact), publishes a new attempt commit.
+        let mut retry = options("consol_3");
+        retry.from_seq = Some(1);
+        let report = Consolidator::run_batch(&repo, &journal, &retry).unwrap();
+        assert!(!report.caught_up);
+        assert_eq!(report.events, 1);
+        assert_ne!(repo.head().unwrap(), head1);
+        let head = repo.head().unwrap();
+        let alice = EntityFile::parse(
+            &repo.read_snapshot(&head, "memory/people/alice.md").unwrap().unwrap().content,
+        )
+        .unwrap();
+        assert_eq!(alice.facts.len(), 1);
+        // from_seq=0/None never rewinds.
+        let mut noop = options("consol_4");
+        noop.from_seq = Some(0);
+        assert!(Consolidator::run_batch(&repo, &journal, &noop).unwrap().caught_up);
+    }
+
+    #[test]
+    fn dispositions_without_batches_still_parse() {
+        // Backward compat: files written before BatchReport existed.
+        let raw = r#"{"request_id":"c","extractor":"rules","from_seq":1,"through_seq":2,"accepted":[],"quarantined":{}}"#;
+        let d: Dispositions = serde_json::from_str(raw).unwrap();
+        assert!(d.batches.is_empty());
+        // And the new shape round-trips with batch detail.
+        let full = Dispositions {
+            request_id: "c".into(),
+            extractor: ExtractorKind::Rules,
+            from_seq: 1,
+            through_seq: 2,
+            accepted: vec![],
+            quarantined: Default::default(),
+            batches: vec![BatchReport {
+                batch: 0,
+                from_seq: 1,
+                through_seq: 2,
+                proposed: 0,
+                accepted: vec![],
+                rejected: vec![],
+            }],
+        };
+        let back: Dispositions = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back.batches.len(), 1);
+        assert_eq!(back.batches[0].proposed, 0);
     }
 
     #[test]

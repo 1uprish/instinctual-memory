@@ -283,6 +283,11 @@ pub enum Command {
         /// after that batch.
         #[arg(long)]
         request_id: Option<String>,
+        /// Rewind the checkpoint and re-process from this seq (1-based).
+        /// Re-extraction is idempotent (fact ids are deterministic hashes),
+        /// so a run that came back empty can simply be attempted again.
+        #[arg(long)]
+        from_seq: Option<u64>,
     },
     /// Search curated facts and journal events together. Rows are reranked
     /// by JEV when a key is set, else by the local model if downloaded.
@@ -624,7 +629,8 @@ pub fn run(cli: &Cli) -> Result<()> {
             extractor,
             high_water,
             request_id,
-        } => cmd_consolidate(cli, extractor.kind(), *high_water, request_id.as_deref()),
+            from_seq,
+        } => cmd_consolidate(cli, extractor.kind(), *high_water, request_id.as_deref(), *from_seq),
         Command::Search {
             query,
             limit,
@@ -2250,6 +2256,7 @@ fn cmd_consolidate(
     extractor: ExtractorKind,
     high_water: u64,
     request_id: Option<&str>,
+    from_seq: Option<u64>,
 ) -> Result<()> {
     let repo = GitRepo::open(cli.root.join("memory.git"))?;
     let journal = Journal::open(cli.root.join("journal"))?;
@@ -2269,6 +2276,7 @@ fn cmd_consolidate(
             request_id: batch_id,
             high_water,
             scope_id: Some(cli.scope.clone()),
+            from_seq: if batch == 1 { from_seq } else { None },
         };
         let report = Consolidator::run_batch(&repo, &journal, &options)?;
         if report.caught_up {
@@ -2282,8 +2290,8 @@ fn cmd_consolidate(
         totals.1 += report.accepted;
         totals.2 += report.facts;
         eprintln!(
-            "[consolidate] batch {batch} ({:?}): through seq {}, {} event(s), {} new fact(s), {} entit(ies) changed",
-            report.extractor, report.through_seq, report.events, report.facts, report.entities_changed
+            "[consolidate] batch {batch} ({:?}): through seq {}, {} event(s), {} proposed, {} new fact(s), {} rejected, {} entit(ies) changed",
+            report.extractor, report.through_seq, report.events, report.proposed, report.facts, report.rejected, report.entities_changed
         );
         if request_id.is_some() {
             println!("Consolidated to {}", report.revision);
